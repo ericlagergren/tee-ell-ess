@@ -61,6 +61,8 @@ std = [
 	"zeroize/std",
 ]
 
+tls12 = []
+
 [dependencies]
 buggy = { version = "0.1", default-features = false }
 cfg-if = { version = "1", default-features = false }

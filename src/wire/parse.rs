@@ -1,187 +1,100 @@
-use core::{fmt, ops::Deref};
+use core::marker::PhantomData;
 
-use buggy::{bug, Bug, BugExt};
+use crate::wire::{types::u24, Error, Object};
 
-use crate::{error::Error, wire::alert::Alert};
+/// Parses the TLS wire format.
+///
+/// # Lifetime
+///
+/// `'de` is the lifetime of the the data that can be borrowed by
+/// `Self`.
+///
+/// ```ignore
+/// // Good!
+/// impl<'de: 'a, 'a> TryParse<'de> for Good<'a> {
+///     fn try_parse(data: &'de [u8]) -> Result<(Self, &'de [u8]) -> Result<(Self, &'de [u8]), Error> {
+///         ...
+///     }
+/// }
+///
+/// // Bad!
+/// impl<'de> TryParse<'de> for Bad<'de> {
+///     fn try_parse(data: &'de [u8]) -> Result<(Self, &'de [u8]) -> Result<(Self, &'de [u8]), Error> {
+///         ...
+///     }
+/// }
+/// ```
+pub trait TryParse<'de, T = Self>: Object + Sized {
+    /// Parses `T` from `data` and returns `T` and the remaining
+    /// data, if any.
+    fn try_parse(data: &'de [u8]) -> Result<(T, &'de [u8]), Error>;
 
-/// TODO
-#[derive(Debug, thiserror::Error)]
-#[error("parse error: {repr}")]
-pub struct ParseError {
-    repr: Repr,
-}
-
-impl ParseError {
+    /// Like [`try_parse`][Self::try_parse], but there cannot be
+    /// any remaining data.
     #[inline]
-    pub(crate) const fn unexpected_eof() -> Self {
-        Self {
-            repr: Repr::Decode("unexpected end of input"),
+    fn try_parse_all(data: &'de [u8]) -> Result<T, Error> {
+        let (v, rest) = Self::try_parse(data)?;
+        if !rest.is_empty() {
+            println!("rest = {rest:x?}");
+            Err(Error::decode_error("unexpected trailing data"))
+        } else {
+            Ok(v)
         }
     }
-}
 
-impl Clone for ParseError {
+    /// Skips past the current object and returns the remaining
+    /// data.
     #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            repr: self.repr.clone(),
-        }
+    fn try_skip(data: &'de [u8]) -> Result<&'de [u8], Error> {
+        Self::try_parse(data).map(|(_, rest)| rest)
     }
 }
 
-impl<T: Into<Repr>> From<T> for ParseError {
-    fn from(err: T) -> Self {
-        Self { repr: err.into() }
+impl<'de> TryParse<'de> for () {
+    #[inline]
+    fn try_parse(data: &'de [u8]) -> Result<(Self, &'de [u8]), Error> {
+        Ok(((), data))
     }
 }
 
-impl From<ParseError> for Alert {
-    fn from(_err: ParseError) -> Self {
-        Alert::decode_error()
-    }
-}
-
-impl From<ParseError> for Error {
-    fn from(_err: ParseError) -> Self {
-        Error::from(Alert::decode_error())
-    }
-}
-
-#[derive(Clone, Debug, thiserror::Error)]
-enum Repr {
-    #[error("{0}")]
-    Bug(#[from] Bug),
-    #[error("{0}")]
-    Decode(&'static str),
-}
-
-impl From<&'static str> for Repr {
-    fn from(context: &'static str) -> Self {
-        Self::Decode(context)
-    }
-}
-
-/// TODO
-pub trait TryParse<'a, T = Self>: Sized {
-    /// TODO
-    fn try_parse(data: &'a [u8]) -> Result<(T, &'a [u8]), ParseError>;
-}
-
-/// A variable-length vector.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct Vector<'a, const MIN: usize, const MAX: usize> {
-    pub(crate) data: &'a [u8],
-}
-
-impl<'a, const MIN: usize, const MAX: usize> Vector<'a, MIN, MAX> {
-    pub(crate) const MAX: usize = MAX;
-
-    const SIZE: usize = {
-        let bits = usize::BITS - MAX.leading_zeros();
-        ((bits + 7) / 8) as usize
+macro_rules! impl_scalar_try_parse {
+    ($($name:ident)*) => {
+        $( impl<'de> TryParse<'de> for $name {
+            #[inline]
+            fn try_parse(data: &'de [u8]) -> Result<(Self, &'de [u8]), Error> {
+                data.split_first_chunk()
+                    .ok_or(Error::unexpected_eof())
+                    .map(|(bytes, rest)| {
+                        let x = <$name>::from_be_bytes(*bytes);
+                        (x, rest)
+                    })
+            }
+        } )*
     };
+}
+impl_scalar_try_parse!(u8 u16 u24 u32 u64);
 
+impl<'de, const N: usize> TryParse<'de> for [u8; N] {
     #[inline]
-    fn parse_len(data: &[u8]) -> Result<(usize, &[u8]), ParseError> {
-        let (len_bytes, rest) = data
-            .split_at_checked(Self::SIZE)
-            .ok_or(ParseError::unexpected_eof())?;
-        let len64 = match len_bytes {
-            [a] => u64::from(*a),
-            [a, b] => u64::from(u16::from_be_bytes([*a, *b])),
-            [a, b, c, d] => u64::from(u32::from_be_bytes([*a, *b, *c, *d])),
-            #[cfg(target_pointer_width = "64")]
-            [a, b, c, d, e, f, g, h] => u64::from_be_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
-            _ => bug!("unreachable pattern"),
-        };
-        let len = usize::try_from(len64).assume("`len64` should not overflow")?;
-        if len < MIN || len > MAX {
-            return Err("invalid length".into());
-        }
-        Ok((len, rest))
+    fn try_parse(data: &'de [u8]) -> Result<(Self, &'de [u8]), Error> {
+        let (data, rest) = data.split_first_chunk().ok_or(Error::unexpected_eof())?;
+        Ok((*data, rest))
     }
+}
 
+impl<'de: 'a, 'a, const N: usize> TryParse<'de> for &'a [u8; N] {
     #[inline]
-    pub(crate) const fn as_slice(&self) -> &'a [u8] {
-        self.data
+    fn try_parse(data: &'de [u8]) -> Result<(Self, &'de [u8]), Error> {
+        data.split_first_chunk().ok_or(Error::unexpected_eof())
     }
 }
 
-impl<'a, const MIN: usize, const MAX: usize> TryParse<'a> for Vector<'a, MIN, MAX> {
+impl<'de: 'a, 'a, T> TryParse<'de> for PhantomData<T>
+where
+    T: TryParse<'de>,
+{
     #[inline]
-    fn try_parse(data: &'a [u8]) -> Result<(Self, &'a [u8]), ParseError> {
-        let (len, rest) = Self::parse_len(data)?;
-        let (data, rest) = rest
-            .split_at_checked(len)
-            .ok_or(ParseError::unexpected_eof())?;
-        Ok((Self { data }, rest))
-    }
-}
-
-impl<'a, const MIN: usize, const MAX: usize> PartialEq<[u8]> for Vector<'a, MIN, MAX> {
-    fn eq(&self, other: &[u8]) -> bool {
-        PartialEq::eq(self.data, other)
-    }
-}
-
-impl<'a, const MIN: usize, const MAX: usize> PartialEq<&[u8]> for Vector<'a, MIN, MAX> {
-    fn eq(&self, other: &&[u8]) -> bool {
-        PartialEq::eq(self.data, *other)
-    }
-}
-
-impl<const MIN: usize, const MAX: usize> Deref for Vector<'_, MIN, MAX> {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.data
-    }
-}
-
-impl<'a, const MIN: usize, const MAX: usize> fmt::Debug for Vector<'a, MIN, MAX> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Vector<{MIN}, {MAX}>({:?})", self.data)
-    }
-}
-
-impl TryParse<'_> for u16 {
-    #[inline]
-    fn try_parse(data: &[u8]) -> Result<(Self, &[u8]), ParseError> {
-        let (v, rest) = data
-            .split_first_chunk()
-            .ok_or(ParseError::unexpected_eof())?;
-        let x = u16::from_be_bytes(*v);
-        Ok((x, rest))
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-#[allow(non_camel_case_types)]
-pub(crate) struct u24(u32);
-
-impl TryParse<'_, usize> for u24 {
-    #[inline]
-    fn try_parse(data: &[u8]) -> Result<(usize, &[u8]), ParseError> {
-        let (v, rest) = data
-            .split_first_chunk::<3>()
-            .ok_or(ParseError::unexpected_eof())?;
-        // TODO(eric): what if `usize` is 16 bits?
-        let x = usize::try_from(u32::from_be_bytes([0, v[0], v[1], v[2]]))
-            .assume("`x` should not overflow")?;
-        Ok((x, rest))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_vector() {
-        let mut data = vec![42; 2 + 300];
-        [data[0], data[1]] = u16::to_be_bytes(300);
-        let (got, rest) = Vector::<300, 400>::try_parse(&data).unwrap();
-        assert_eq!(got, &data[2..]);
-        assert_eq!(rest, &[]);
+    fn try_parse(data: &'de [u8]) -> Result<(Self, &'de [u8]), Error> {
+        T::try_parse(data).map(|(_, rest)| (PhantomData, rest))
     }
 }
