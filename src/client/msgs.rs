@@ -4,6 +4,7 @@ use core::fmt;
 use subtle::ConstantTimeEq;
 
 use crate::{
+    tls::ext::ExtMask,
     util::Hex,
     wire::{
         self,
@@ -39,6 +40,7 @@ impl<'a> HelloBuilder<'a> {
             legacy_session_id: [0; 32],
             extensions: ExtensionList {
                 list: Iter::empty(),
+                mask: ExtMask::empty(),
                 alpn: None,
                 cookie: None,
                 early_data: false,
@@ -227,6 +229,8 @@ impl fmt::Debug for ClientHello<'_> {
 #[derive(Clone)]
 pub struct ExtensionList<'a> {
     list: Iter<'a, Extension<'a>>,
+    mask: ExtMask,
+    len: usize,
 
     alpn: Option<Alpn<'a>>,
     cookie: Option<Cookie<'a>>,
@@ -243,6 +247,8 @@ impl<'a> ExtensionList<'a> {
     const fn empty() -> Self {
         Self {
             list: Iter::empty(),
+            mask: ExtMask::empty(),
+            len: 0,
             alpn: None,
             cookie: None,
             early_data: false,
@@ -261,6 +267,27 @@ impl<'a> ExtensionList<'a> {
 
         use Extension::*;
         for ext in list {
+            let bit = ext.mask_bit();
+            // RFC 8446: "If an implementation receives an
+            // extension which it recognizes and which is not
+            // specified for the message in which it appears, it
+            // MUST abort the handshake with an
+            // "illegal_parameter" alert."
+            if !bit.contains(ExtMask::CH) {
+                return Err(Error::illegal_parameter(
+                    "extension not allowed in `ClientHello`",
+                ));
+            }
+            // RFC 8446: "There MUST NOT be more than one
+            // extension of the same type in a given extension
+            // block."
+            if exts.mask.contains(bit) {
+                return Err(Error::illegal_parameter("duplicate extension"));
+            }
+            exts.mask |= bit;
+
+            exts.len += 1;
+
             println!("ext = {:?}", ext);
             match ext {
                 Alpn(alpn) => exts.alpn = Some(alpn),
@@ -284,6 +311,20 @@ impl<'a> ExtensionList<'a> {
     #[inline]
     pub const fn iter(&self) -> Iter<'_, Extension<'_>> {
         self.list.const_clone()
+    }
+
+    /// Returns the number of extensions in the list.
+    ///
+    /// It's cheaper than calling `self.iter().count()`.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns the extension mask.
+    #[inline]
+    pub const fn mask(&self) -> ExtMask {
+        self.mask
     }
 
     /// Returns the `application_layer_protocol_negotiation`
@@ -414,6 +455,42 @@ pub enum Extension<'a> {
     Unknown(wire::Extension<'a>),
 }
 
+impl Extension<'_> {
+    const fn ty(&self) -> ExtensionType {
+        use ExtensionType::*;
+
+        match self {
+            Self::ServerName(_) => ServerName,
+            Self::MaxFragmentLength(_) => MaxFragmentLength,
+            Self::StatusRequest => StatusRequest,
+            Self::SupportedGroups(_) => SupportedGroups,
+            Self::SignatureAlgorithms => SignatureAlgorithms,
+            Self::UseSrtp => UseSrtp,
+            Self::Heartbeat => Heartbeat,
+            Self::Alpn(_) => Alpn,
+            Self::Sct => Sct,
+            Self::ClientCertificateType => ClientCertificateType,
+            Self::ServerCertificateType => ServerCertificateType,
+            Self::Padding => Padding,
+            Self::PreSharedKey(_) => PreSharedKey,
+            Self::EarlyData => EarlyData,
+            Self::SupportedVersions(_) => SupportedVersions,
+            Self::Cookie(_) => Cookie,
+            Self::PskKexModes(_) => PskKexModes,
+            Self::CertificateAuthorities => CertificateAuthorities,
+            Self::OidFilters => OidFilters,
+            Self::PostHandshakeAuth => PostHandshakeAuth,
+            Self::SignatureAlgorithmsCert => SignatureAlgorithmsCert,
+            Self::KeyShare(_) => KeyShare,
+            Self::Unknown(ext) => ext.extension_type,
+        }
+    }
+
+    const fn mask_bit(&self) -> ExtMask {
+        self.ty().flag()
+    }
+}
+
 impl Object for Extension<'_> {
     const SIZE: Size = wire::Extension::SIZE;
 }
@@ -434,7 +511,7 @@ impl<'de: 'a, 'a> TryParse<'de> for Extension<'a> {
         // println!("data = {:x?}", data);
         // println!("rest = {:x?}", rest);
 
-        let ext = match ext.ty() {
+        let ext = match ext.extension_type {
             ServerName => ext.try_parse_data().map(Self::ServerName)?,
             MaxFragmentLength => ext.try_parse_data().map(Self::MaxFragmentLength)?,
             StatusRequest => Self::StatusRequest,

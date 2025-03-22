@@ -4,7 +4,7 @@ use core::convert::Infallible;
 
 use buggy::Bug;
 
-use crate::wire::alert::Alert;
+use crate::{tls::ext::ExtMask, wire::alert::Alert};
 
 /// The result from parsing or encoding a type.
 pub type Result<T, E = Error> = core::result::Result<T, E>;
@@ -64,6 +64,10 @@ impl Error {
 
     pub(crate) const fn missing_extension(context: &'static str) -> Self {
         Self::new(Alert::missing_extension(), context)
+    }
+
+    pub(crate) const fn unsupported_extension(_mask: ExtMask) -> Self {
+        Self::new(Alert::unsupported_extension(), "")
     }
 }
 

@@ -1,6 +1,7 @@
 use core::fmt;
 
 use crate::{
+    tls::ext::ExtMask,
     wire::{
         self,
         alpn::Alpn,
@@ -20,6 +21,8 @@ pub(crate) type ServerHello = tls13::ServerHello;
 #[derive(Clone)]
 pub struct ServerHelloExtensions<'a> {
     list: Iter<'a, Extension<'a>>,
+    mask: ExtMask,
+    len: usize,
 
     alpn: Option<Alpn<'a>>,
     cookie: Option<Cookie<'a>>,
@@ -35,6 +38,8 @@ impl<'a> ServerHelloExtensions<'a> {
     const fn empty() -> Self {
         Self {
             list: Iter::empty(),
+            mask: ExtMask::empty(),
+            len: 0,
             alpn: None,
             cookie: None,
             early_data: false,
@@ -52,6 +57,8 @@ impl<'a> ServerHelloExtensions<'a> {
 
         use Extension::*;
         for ext in list {
+            exts.mask |= ext.flag();
+            exts.len += 1;
             match ext {
                 Alpn(alpn) => exts.alpn = Some(alpn),
                 Cookie(cookie) => exts.cookie = Some(cookie),
@@ -73,6 +80,20 @@ impl<'a> ServerHelloExtensions<'a> {
     #[inline]
     pub const fn iter(&self) -> Iter<'_, Extension<'_>> {
         self.list.const_clone()
+    }
+
+    /// Returns the number of extensions in the list.
+    ///
+    /// It's cheaper than calling `self.iter().count()`.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns the extension mask.
+    #[inline]
+    pub const fn mask(&self) -> ExtMask {
+        self.mask
     }
 
     /// Returns the `application_layer_protocol_negotiation`
@@ -209,6 +230,42 @@ pub enum Extension<'a> {
     Unknown(wire::Extension<'a>),
 }
 
+impl Extension<'_> {
+    const fn ty(&self) -> ExtensionType {
+        use ExtensionType::*;
+
+        match self {
+            Self::ServerName => ServerName,
+            Self::MaxFragmentLength(_) => MaxFragmentLength,
+            Self::StatusRequest => StatusRequest,
+            Self::SupportedGroups(_) => SupportedGroups,
+            Self::SignatureAlgorithms => SignatureAlgorithms,
+            Self::UseSrtp => UseSrtp,
+            Self::Heartbeat => Heartbeat,
+            Self::Alpn(_) => Alpn,
+            Self::Sct => Sct,
+            Self::ClientCertificateType => ClientCertificateType,
+            Self::ServerCertificateType => ServerCertificateType,
+            Self::Padding => Padding,
+            Self::PreSharedKey(_) => PreSharedKey,
+            Self::EarlyData => EarlyData,
+            Self::SupportedVersions(_) => SupportedVersions,
+            Self::Cookie(_) => Cookie,
+            Self::PskKexModes(_) => PskKexModes,
+            Self::CertificateAuthorities => CertificateAuthorities,
+            Self::OidFilters => OidFilters,
+            Self::PostHandshakeAuth => PostHandshakeAuth,
+            Self::SignatureAlgorithmsCert => SignatureAlgorithmsCert,
+            Self::KeyShare(_) => KeyShare,
+            Self::Unknown(ext) => ext.extension_type,
+        }
+    }
+
+    const fn flag(&self) -> ExtMask {
+        self.ty().flag()
+    }
+}
+
 impl Object for Extension<'_> {
     const SIZE: Size = wire::Extension::SIZE;
 }
@@ -229,7 +286,7 @@ impl<'de: 'a, 'a> TryParse<'de> for Extension<'a> {
         // println!("data = {:x?}", data);
         // println!("rest = {:x?}", rest);
 
-        let ext = match ext.ty() {
+        let ext = match ext.extension_type {
             ServerName => Self::ServerName,
             MaxFragmentLength => ext.try_parse_data().map(Self::MaxFragmentLength)?,
             StatusRequest => Self::StatusRequest,

@@ -14,22 +14,6 @@ define_struct! {
     } Extension<'a>;
 }
 
-impl Extension<'_> {
-    /// Returns the extension type.
-    #[inline]
-    pub const fn ty(&self) -> ExtensionType {
-        self.extension_type
-    }
-
-    /// Returns the opaque extension data.
-    ///
-    /// Note that this does not include the vector length.
-    #[inline]
-    pub const fn data(&self) -> &[u8] {
-        self.extension_data.as_slice()
-    }
-}
-
 impl<'a> Extension<'a> {
     #[inline]
     pub(crate) fn try_parse_data<T>(&self) -> Result<T, Error>
@@ -38,27 +22,6 @@ impl<'a> Extension<'a> {
     {
         T::try_parse_all(self.extension_data.into_slice())
     }
-
-    // #[inline]
-    // pub(crate) fn try_encode_data<'b, T>(dst: &'b mut [u8], data: &T) -> Result<&'b mut [u8], Error>
-    // where
-    //     T: TryEncode,
-    // {
-    //     const MIN: usize = Extension {
-    //         extension_type: ExtensionType::ServerName,
-    //         extension_data: Vector::empty(),
-    //     }
-    //     .extension_data
-    //     .min_size();
-    //     const MAX: usize = Extension {
-    //         extension_type: ExtensionType::ServerName,
-    //         extension_data: Vector::empty(),
-    //     }
-    //     .extension_data
-    //     .max_size();
-
-    //     todo!()
-    // }
 }
 
 define_scalar_enum! {

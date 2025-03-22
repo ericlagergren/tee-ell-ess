@@ -8,6 +8,7 @@ use crate::{
     io::{Read, Write},
     server::msgs::{ServerHello, ServerHelloExtensions},
     tls::{
+        ext::ExtMask,
         msgs::{HandshakeHeader, RecordHeader},
         MAX_HANDSHAKE_SIZE,
     },
@@ -64,7 +65,8 @@ impl<'a> NeedHandshake<'a> {
         W: Write,
     {
         let ctx = self.send_client_hello(write).await?;
-        self.recv_server_hello_or_hrr(&ctx, read, write).await?;
+        let ctx = self.recv_server_hello(&ctx, read, write).await?;
+        self.recv_encrypted_extensions(&ctx, read).await?;
 
         Ok(Conn { cfg: self.cfg })
     }
@@ -90,7 +92,10 @@ impl<'a> NeedHandshake<'a> {
             .build(&mut buf)?;
         w.write_all(hello).await?;
 
-        Ok(SentClientHello { session_id: id })
+        Ok(SentClientHello {
+            session_id: id,
+            mask: ExtMask::empty(),
+        })
     }
 
     /// Receives the `ServerHello` or `HelloRetryRequest` from
@@ -98,18 +103,13 @@ impl<'a> NeedHandshake<'a> {
     ///
     /// If necessary, it sends a second `ClientHello` to the
     /// server.
-    async fn recv_server_hello_or_hrr<R: Read, W: Write>(
+    async fn recv_server_hello<R: Read, W: Write>(
         &mut self,
         ctx: &SentClientHello,
         r: &mut R,
         w: &mut W,
-    ) -> Result<(), Error> {
-        let hdr = self.read_hs_msg(r).await?;
-        if hdr.msg_type != HandshakeType::ServerHello {
-            return Err(wire::Error::unexpected_message("expected `ServerHello`").into());
-        }
-
-        let mut hello = self.recv.read_type::<ServerHello>()?;
+    ) -> Result<RecvdServerHello, Error> {
+        let mut hello = self.read_server_hello(r).await?;
 
         // RFC 8446: "Upon receiving a message with type
         // server_hello, implementations MUST first examine the
@@ -136,14 +136,20 @@ impl<'a> NeedHandshake<'a> {
             if hrr_vers.is_none() {
                 return Err(wire::Error::missing_extension("supported_versions").into());
             }
-            self.send_client_hello(w).await?;
 
-            let hdr = self.read_hs_msg(r).await?;
-            if hdr.msg_type != HandshakeType::ServerHello {
-                return Err(wire::Error::unexpected_message("expected `ServerHello`").into());
+            // RFC 8446: "As with the ServerHello,
+            // a HelloRetryRequest MUST NOT contain any
+            // extensions that were not first offered by the
+            // client in its ClientHello, with the exception of
+            // optionally the "cookie" (see Section
+            // 4.2.2) extension."
+            if !(ctx.mask | ExtMask::COOKIE).contains(exts.mask()) {
+                return Err(wire::Error::unsupported_extension(exts.mask()).into());
             }
 
-            hello = self.recv.read_type()?;
+            self.send_second_client_hello(ctx, w).await?;
+
+            hello = self.read_server_hello(r).await?;
             if hello.is_hello_retry_request() {
                 // RFC 8446: "If a client receives a second
                 // HelloRetryRequest in the same connection
@@ -161,7 +167,20 @@ impl<'a> NeedHandshake<'a> {
 
         let exts = self.recv.read_type::<ServerHelloExtensions<'_>>()?;
 
-        let _version = {
+        // RFC 8446: "Implementations MUST NOT send extension
+        // responses if the remote endpoint did not send the
+        // corresponding extension requests, with the exception
+        // of the "cookie" extension in the HelloRetryRequest.
+        // Upon receiving such an extension, an endpoint MUST
+        // abort the handshake with an "unsupported_extension"
+        // alert."
+        if exts.len() > ctx.mask.bits().count_ones() as usize
+            || !(ctx.mask | ExtMask::COOKIE).contains(exts.mask())
+        {
+            return Err(wire::Error::unsupported_extension(exts.mask()).into());
+        }
+
+        let version = {
             // RFC 8446: "The value of selected_version in the
             // HelloRetryRequest "supported_versions" extension
             // MUST be retained in the ServerHello, and a client
@@ -193,7 +212,9 @@ impl<'a> NeedHandshake<'a> {
             version
         };
 
-        Ok(())
+        // TODO: parse key_share, psk
+
+        Ok(RecvdServerHello { version })
     }
 
     fn check_server_hello(&self, ctx: &SentClientHello, hello: &ServerHello) -> Result<(), Error> {
@@ -277,6 +298,16 @@ impl<'a> NeedHandshake<'a> {
         Ok(())
     }
 
+    /// Receives `EncryptedExtensions` from the server.
+    async fn recv_encrypted_extensions<R: Read>(
+        &mut self,
+        _ctx: &RecvdServerHello,
+        _r: &mut R,
+    ) -> Result<(), Error> {
+        // TODO
+        Ok(())
+    }
+
     /// Reads a handshake message from `rd`.
     async fn read_hs_msg<R: Read>(&mut self, rd: &mut R) -> Result<HandshakeHeader, Error> {
         self.read_hs_bytes_from(rd, HandshakeHeader::SIZE).await?;
@@ -285,6 +316,15 @@ impl<'a> NeedHandshake<'a> {
         self.read_hs_bytes_from(rd, hdr.length).await?;
 
         Ok(hdr)
+    }
+
+    /// Reads a handshake message from `rd`.
+    async fn read_server_hello<R: Read>(&mut self, rd: &mut R) -> Result<ServerHello, Error> {
+        let hdr = self.read_hs_msg(rd).await?;
+        if hdr.msg_type != HandshakeType::ServerHello {
+            return Err(wire::Error::unexpected_message("expected `ServerHello`").into());
+        }
+        self.recv.read_type::<ServerHello>()
     }
 
     /// Reads `n` handshake bytes from `rd`.
@@ -358,8 +398,17 @@ struct HalfConn<'a> {
     seq: u64,
 }
 
+#[derive(Debug)]
 struct SentClientHello {
+    // The session ID we chose.
     session_id: [u8; 32],
+    // The extensions we sent.
+    mask: ExtMask,
+}
+
+#[derive(Debug)]
+struct RecvdServerHello {
+    version: Version,
 }
 
 #[derive(Copy, Clone, Debug)]

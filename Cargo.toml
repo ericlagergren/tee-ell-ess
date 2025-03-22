@@ -56,6 +56,7 @@ experimental = []
 std = [
 	"alloc",
 
+	"bitflags/std",
 	"buggy/std",
 	"thiserror/std",
 	"zeroize/std",
@@ -64,6 +65,7 @@ std = [
 tls12 = []
 
 [dependencies]
+bitflags = { version = "2", default-features = false }
 buggy = { version = "0.1", default-features = false }
 cfg-if = { version = "1", default-features = false }
 subtle = { version = "2.6", default-features = false, features = ["core_hint_black_box"] }

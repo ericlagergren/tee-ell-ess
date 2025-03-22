@@ -63,6 +63,10 @@ impl Alert {
     pub(crate) const fn missing_extension() -> Self {
         Self::new(AlertDesc::MissingExtension)
     }
+
+    pub(crate) const fn unsupported_extension() -> Self {
+        Self::new(AlertDesc::UnsupportedExtension)
+    }
 }
 
 define_scalar_enum! {
